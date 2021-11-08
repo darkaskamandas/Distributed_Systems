@@ -1,0 +1,197 @@
+#include <vector>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <cmath>
+
+struct Node
+{
+  uint32_t parent;
+  double pct;
+};
+
+struct Query
+{
+  Query(uint32_t _src, uint32_t _dst, double _thr) :
+    src(_src), dst(_dst), thr(_thr)
+  { };
+  uint32_t src;
+  uint32_t dst;
+  double thr;
+};
+
+std::vector<Node> g_tree;
+
+void init_server()
+{
+  printf("Reading configuration\n");
+  fflush(stdout);
+
+  std::string training_path("training.txt");
+  
+  std::ifstream f(training_path.c_str());
+  
+  if (f)
+  {
+    uint32_t num_nodes;
+    f >> num_nodes;
+
+    uint32_t num_conns = num_nodes - 1;
+
+    {
+      Node default_;
+      default_.parent = 0;
+      default_.pct = 1.0;
+      g_tree.resize(num_nodes, default_);
+    }
+    
+    uint32_t child, pct;
+    char sep;
+
+    for (uint32_t i = 0; i < num_conns; ++i)
+    {
+      Node n;
+      f >> n.parent >> sep >> child >> sep >> pct;
+      n.pct = pct / 100.0;
+      // subtract 1 for zero-based index
+      n.parent--;
+      if (sep != ',')
+        std::cout << "Bad separator for entry #" << i + 1 << "!" << std::endl;
+      // subtract 1 from both since we need zero-based indexing
+      g_tree[child - 1] = n;
+    }
+    
+    f.close();
+  }
+  else
+  {
+    std::cout << "Couldn't open 'training.txt'." << std::endl;
+  }
+}
+
+static Query parse_query(const char *msg, const uint32_t len);
+
+static bool process_query(const Query &q);
+
+void * process_client_connection(void * ptr)
+{
+  connection_t * conn;
+  std::vector<Query> queries;
+
+  if (!ptr)
+    pthread_exit(0);
+  conn = (connection_t *)ptr;
+
+  printf("Connection received\n");
+  fflush(stdout);
+
+  char delim;
+
+  int terminate_client = 0;
+  do
+  {
+    char *message = NULL;
+    uint32_t message_length = 0;
+
+    read_string_from_socket(conn->sock, &message, &message_length);
+
+    printf("Received = %s\n", message);
+
+    if (strcmp(message, "END") == 0)
+    {
+      terminate_client = 1;
+    }
+    else
+    {
+      queries.emplace_back(parse_query(message, message_length));
+    }
+
+    free(message);
+
+  } while(!terminate_client);
+
+  char resp[10];
+  for (auto &q : queries)
+  {
+    bool result = process_query(q);
+
+    if (result)
+      strcpy(resp, "YES");
+    else
+      strcpy(resp, "NO");
+    std::cout << resp << std::endl;
+    write_string_to_socket(conn->sock, resp, strlen(resp));
+  }
+
+  strcpy(resp, "END");
+  write_string_to_socket(conn->sock, resp, strlen(resp));
+  
+  /* close socket and clean up */
+  printf("Closing client on socket %d\n", conn->sock);
+  fflush(stdout);
+  close(conn->sock);
+  free(conn);
+  pthread_exit(0);
+}
+
+static Query parse_query(const char *msg, const uint32_t len)
+{
+  std::stringstream ss;
+  
+  uint32_t src, dst;
+  char delim;
+  double thr;
+  
+  ss.write(msg, len);
+  ss >> src >> delim >> dst >> delim >> thr;
+  thr = pow(10, thr);
+  return Query(src, dst, thr);
+}
+
+static bool process_query(const Query &query)
+{
+  uint32_t pS = query.src - 1,
+    pD = query.dst - 1;
+
+  double prob = 1.0;
+  double thr = query.thr;
+  std::cout << "Processing: " << query.src << " -> " << query.dst
+            << " ... " << thr << std::endl;
+
+  while (true)
+  {
+    if (pS > pD)
+    {
+      prob *= g_tree[pS].pct;
+      pS = g_tree[pS].parent;
+    }
+    else if (pD > pS)
+    {
+      prob *= g_tree[pD].pct;
+      pD = g_tree[pD].parent;
+    }
+    else
+    {
+      if (prob < thr)
+      {
+        std::cout << "...... " << prob << std::endl;
+        return false;
+      }
+      else
+      {
+        std::cout << "...... " << prob << std::endl;
+        return true;
+      }
+    }
+    if (prob < thr)
+    {
+      std::cout << "...... " << prob << std::endl;
+      return false;
+    }
+  }
+
+  // to make the compiler happy
+  return false;
+}
