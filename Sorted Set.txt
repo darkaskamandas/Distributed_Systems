@@ -1,0 +1,370 @@
+#include <cmath>
+#include <cstdio>
+#include <vector>
+#include <iostream>
+#include <algorithm>
+#include <stdint.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <map>
+//#include <multimap>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <stdio.h>
+
+using namespace std;
+
+// NOTE: Use this path to create the UDS Server socket
+char* SERVER_SOCKET_PATH = "./socket";
+
+
+
+typedef pair<uint32_t, uint32_t> KV;
+
+class ScoreSet
+{
+    //key -> score
+    map<uint32_t, uint32_t> ks_;
+    //score -> key
+    multimap<uint32_t, uint32_t> sk_;
+
+    void remove(uint32_t score, uint32_t key)
+    {
+        auto ret = sk_.equal_range(score);
+        for(auto it = ret.first; it != ret.second; ++it)
+            if (it->second == key) {
+                sk_.erase(it);
+                return;
+            }
+    }
+
+    pthread_spinlock_t l_;
+
+    void lock()
+    {
+        pthread_spin_lock(&l_);
+    }
+
+    void unlock()
+    {
+        pthread_spin_unlock(&l_);
+    }
+
+public:
+    ScoreSet() 
+    {
+        pthread_spin_init(&l_, 0);
+    }
+
+    ~ScoreSet()
+    {
+        pthread_spin_destroy(&l_);
+    }
+
+    void Add(uint32_t key, uint32_t score)
+    {
+        lock();
+        auto it = ks_.find(key);
+        if (it == ks_.end()) {
+            ks_[key] = score;
+            sk_.insert({score, key});
+        } else {
+            remove(it->second, key);
+            sk_.insert({score, key});
+            it->second = score;
+        }
+        unlock();
+    }
+
+    void Remove(uint32_t key)
+    {
+        lock();
+        auto it = ks_.find(key);
+        if (it != ks_.end()) {
+            remove(it->second, key);
+            ks_.erase(it);
+        }
+        unlock();
+    }
+
+    uint32_t Size()
+    {
+        return ks_.size();
+    }
+
+    uint32_t Get(uint32_t key)
+    {
+        uint32_t ret;
+        lock();
+        auto it = ks_.find(key);
+        if (it == ks_.end())
+            ret = 0;
+        else
+            ret =  it->second;
+        unlock();
+        return it->second;
+    }
+
+    void GetRange(uint32_t lower, uint32_t upper, vector<KV>& ret)
+    {
+        lock();
+        auto it = sk_.lower_bound(lower);
+        for( ; it != sk_.end() && it->first <= upper; it++) {
+            ret.push_back({it->second, it->first});
+        }
+        unlock();
+    }
+};
+
+
+ssize_t myread(int fd, void *buf, int bytes)
+{
+    char *cbuf = (char *)buf;
+    int cur = 0;
+    for( ; cur < bytes; ) {
+        int ret = read(fd, cbuf + cur, bytes - cur);
+        if (ret == 0)
+            return 0;
+        cur += ret;
+    }
+    return cur;
+}
+
+ssize_t mywrite(int fd, void *buf, int bytes)
+{
+    char *cbuf = (char *)buf;
+    int cur = 0;
+    for( ; cur < bytes; ) {
+        int ret = write(fd, cbuf + cur, bytes - cur);
+        cur += ret;
+    }
+    return cur;
+}
+
+
+class SetMgr
+{
+    map<uint32_t, ScoreSet*> sets_;
+
+    pthread_spinlock_t l_;
+
+    void lock()
+    {
+        pthread_spin_lock(&l_);
+    }
+
+    void unlock()
+    {
+        pthread_spin_unlock(&l_);
+    }
+
+
+public:
+    int serverfd;
+
+    SetMgr() 
+    {
+        pthread_spin_init(&l_, 0);
+    }
+
+    ~SetMgr()
+    {
+        pthread_spin_destroy(&l_);
+    }
+
+
+    ScoreSet *Put(uint32_t key)
+    {
+        ScoreSet *ret;
+        lock();
+        auto it = sets_.find(key);
+        if (it == sets_.end()) {
+            ret = new ScoreSet();
+            sets_.insert({key, ret});
+        } else 
+            ret = it->second;
+        unlock();
+        return ret;
+    }
+
+    ScoreSet *Get(uint32_t key)
+    {
+        ScoreSet *ret;
+        lock();
+        auto it = sets_.find(key);
+        if (it == sets_.end()) {
+            ret = NULL;
+        } else 
+            ret = it->second;
+        unlock();
+        return ret;
+    }
+
+    void AddKV(int fd, uint32_t *buf)
+    {
+        uint32_t ret = 0;
+        auto ss = Put(buf[1]);
+        ss->Add(buf[2], buf[3]);
+        mywrite(fd, &ret, 4);
+    }
+
+    void RemoveKV(int fd, uint32_t *buf)
+    {
+        uint32_t ret = 0;
+        auto ss = Get(buf[1]);
+        if (ss)
+            ss->Remove(buf[2]);
+        mywrite(fd, &ret, 4);
+    }
+
+    void Size(int fd, uint32_t *buf)
+    {
+        uint32_t ret = 0;
+        uint32_t wbuf[2];
+        auto ss = Get(buf[1]);
+        if (ss)
+            ret = ss->Size();
+        wbuf[0] = htonl(1);
+        wbuf[1] = htonl(ret);
+        mywrite(fd, wbuf, 8);
+    }
+
+    void GetKV(int fd, uint32_t *buf)
+    {
+        uint32_t ret = 0;
+        uint32_t wbuf[2];
+        auto ss = Get(buf[1]);
+        if (ss)
+            ret = ss->Get(buf[2]);
+        wbuf[0] = htonl(1);
+        wbuf[1] = htonl(ret);
+        mywrite(fd, wbuf, 8);
+    }
+
+    void GetRange(int fd, uint32_t *buf, uint32_t l, uint32_t u)
+    {
+        vector<KV> ret;
+        int p = 1;
+        for(; buf[p] != 0; p++) {
+            auto ss = Get(buf[p]);
+            if (!ss)
+                continue;
+            ss->GetRange(l, u, ret);
+        }
+
+        sort(ret.begin(), ret.end(), [&](const KV& i1, const KV& i2) {
+                    if (i1.first == i2.first)
+                        return i1.second < i2.second;
+                    return i1.first < i2.first;
+                });
+        uint32_t *wbuf = new uint32_t[ret.size() * 2 + 1];
+        wbuf[0] = htonl(ret.size() * 2);
+        for(int i = 0; i < ret.size(); i++) {
+            wbuf[2 * i + 1] = htonl(ret[i].first);
+            wbuf[2 * i + 2] = htonl(ret[i].second);
+        }
+        mywrite(fd, wbuf, 4 * (ret.size() * 2 + 1));
+        delete[] wbuf;
+    }
+};
+
+
+void *thread_proc(void *arg)
+{
+    SetMgr *sm = (SetMgr *)arg;
+
+    for (;;) { 
+        int fd = accept(sm->serverfd, 0, 0);
+        
+        // I / O
+        while(fd > 0) {
+            //printf("Got connection fd %d\n", fd);
+            uint32_t arg_num;
+            ssize_t ret;
+            ret = myread(fd, &arg_num, 4);
+            arg_num = ntohl(arg_num);
+            
+            //if (ret != 4) 
+            //    printf("int packet not size 4!\n");
+            uint32_t *buf = new uint32_t[arg_num];
+            ret = myread(fd, buf, 4 * arg_num);
+            //if (ret != 4 * arg_num) 
+            //    printf("int packet not size 4!\n");
+            for(uint32_t i = 0; i < arg_num; i++)
+                buf[i] = ntohl(buf[i]);
+
+            switch(buf[0]) {
+                case 1:
+                    // add
+                    //printf("Add\n");
+                    sm->AddKV(fd, buf);
+                    break;
+                case 2:
+                    //rm
+                    //printf("RM\n");
+                    sm->RemoveKV(fd, buf);
+                    break;
+                case 3:
+                    //size
+                    //printf("Size\n");
+                    sm->Size(fd, buf);
+                    break;
+                case 4:
+                    //get
+                    //printf("Get\n");
+                    sm->GetKV(fd, buf);
+                    break;
+                case 5:
+                    //get range
+                    //printf("Range\n");
+                    sm->GetRange(fd, buf, buf[arg_num - 2], buf[arg_num - 1]);
+                    break;
+                case 6:
+                    //close
+                    close(fd);
+                    fd = -1;
+                    break;
+                default:
+                    //printf("Wrong cmd %u\n", buf[0]);
+                    fd = -1;
+                    break;
+            }
+            delete[] buf;
+        } //end while conn close
+        //printf("connection closed\n");
+    } // never ends
+
+    return NULL;
+}
+
+
+int main() {
+
+    int serverfd; 
+    struct sockaddr_un server; 
+
+    SetMgr *sm = new SetMgr();
+
+    serverfd = socket(AF_UNIX, SOCK_STREAM, 0); if (serverfd < 0) { exit(1); } 
+    server.sun_family = AF_UNIX; 
+    strcpy(server.sun_path, SERVER_SOCKET_PATH); 
+    if (bind(serverfd, (struct sockaddr *) &server, sizeof(struct sockaddr_un))) {
+       exit(1); 
+    }
+    listen(serverfd, 12); 
+    pthread_t ts[8];
+
+    sm->serverfd = serverfd;
+    for(int i = 0; i < 32; i++) {
+        pthread_create(&ts[i], NULL, thread_proc, sm);
+    }
+    thread_proc(sm);
+
+    /* Enter your code here. Read input from STDIN. Print output to STDOUT */   
+    return 0;
+}
+
+
+
