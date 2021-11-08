@@ -1,0 +1,121 @@
+/*
+Use this function to write data to socket
+void write_string_to_socket(int sock_descriptor, char* message, uint32_t length);
+
+Use this function to read data from socket
+void read_string_from_socket(int sock_descriptor, char** message, uint32_t *length);
+*/
+#include <iostream>
+#include <unordered_map>
+#include <vector>
+using namespace std;
+
+// All global declarations go here
+struct Distance
+{
+    int ancestor;
+    int distance;
+};
+
+vector<int> parents;
+/*
+This function is called only once before any client connection is accepted by the server.
+Read any global datasets or configurations here
+*/
+void init_server()
+{
+   printf("Reading configuration\n");
+     fflush(stdout);
+    
+    FILE* fin = fopen("training.txt", "r");
+    int n;
+    fscanf(fin, "%d\n", &n);
+    // nodes staring from '1'
+    parents.resize(n + 1);
+    parents[1] = 1;
+    
+    for (int i = 0; i < n - 1; i++) {
+        int parent, child;
+        fscanf(fin, "%d,%d\n", &parent, &child);
+        parents[child] = parent;
+    }
+    
+    fclose(fin);
+}  
+
+bool check_reachability(int src, int dst, int limit) {
+    printf("Checking for path from %d to %d within %d\n", src, dst, limit);
+
+    int cost = 1;
+    while (src != dst && cost <= limit) {
+        if (src > dst) {
+            src = parents[src];
+        } else {
+            dst = parents[dst];
+        }
+        cost++;
+    }
+    if (src == dst && cost <= limit) {        
+        printf("> Found path via %d\n!", src);
+        return true;
+    } else {
+        printf("> No path found within given limit.\n");
+        return false;
+    }
+}
+
+/*
+Write your code here
+This function is called everytime a new connection is accepted by the server
+*/
+void * process_client_connection(void * ptr)
+{
+    connection_t * conn;
+
+    if (!ptr) pthread_exit(0); 
+    conn = (connection_t *)ptr;
+
+    printf("Connection received\n");
+     fflush(stdout);
+
+    int terminate_client = 0;
+    do
+    {
+        /* read length of message */
+        char *message = NULL;
+        uint32_t message_length = 0;
+
+        /* read message */
+        read_string_from_socket(conn->sock, &message, &message_length);
+
+        printf("Received = %s\n", message);
+
+        /* End of operation on this clinet */
+        if (strcmp(message, "END") == 0) {
+            terminate_client = 1;
+        } else {
+            int src, dst, limit;
+            sscanf(message, "%d,%d,%d", &src, &dst, &limit);
+            
+            char *response = NULL;
+            if (check_reachability(src, dst, limit)) {
+                response = "YES";
+            } else {
+                response = "NO";
+            }
+            
+            /* write message */
+            write_string_to_socket(conn->sock, response, strlen(response));
+        }
+        
+        free(message);
+
+    } while(!terminate_client);
+
+    /* close socket and clean up */
+    printf("Closing client on socket %d\n", conn->sock);
+     fflush(stdout);
+    close(conn->sock);
+    free(conn);
+    pthread_exit(0);
+}
